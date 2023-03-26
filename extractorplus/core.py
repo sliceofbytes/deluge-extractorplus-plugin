@@ -43,6 +43,7 @@ DEFAULT_PREFS = {'extract_path': '',
                  'extract_torrent_root': True,
                  'use_temp_dir': True,
                  'append_matched_label': False,
+                 'append_file_name': False,
                  'label_filter': '',
                  'auto_cleanup': False,
                  'cleanup_time': 2,
@@ -50,8 +51,11 @@ DEFAULT_PREFS = {'extract_path': '',
                  }
 
 EXTRACTED_FILES = {}
-EXTRACT_COMMANDS = {}
+PROCESS_COMMANDS = {}
 EXTRA_COMMANDS = {}
+
+# Extensions to copy to the output folder.
+ext_cp = ['.mkv']
 
 if windows_check():
     egg_path = pkg_resources.resource_filename(__name__, "7z.exe")
@@ -73,14 +77,15 @@ if windows_check():
             l2_cmds = [win_7z_exe, 'x', '-y', '-ttar', '-si', '-aoa']
             log.debug("Found 7z: %s" % win_7z_exe)
             cmds = dict.fromkeys(ext_7z, l1_cmds)
-            EXTRACT_COMMANDS = {**cmds, **dict.fromkeys(ext_tar, l1t_cmds)}
+            PROCESS_COMMANDS = {**cmds, **dict.fromkeys(ext_tar, l1t_cmds)}
             EXTRA_COMMANDS = dict.fromkeys(ext_tar, l2_cmds)
             break
 
 else:
-    required_cmds = ['unrar', 'unzip', 'tar', '7zr']
+    required_cmds = ['unrar', 'unzip', 'tar', '7zr', 'cp']
 
-    EXTRACT_COMMANDS = {
+
+    PROCESS_COMMANDS = {
         '.rar': ['unrar', 'x', '-o+', '-y'],
         '.r00': ['unrar', 'x', '-o+', '-y'],
         '.tar': ['tar', '-xf'],
@@ -93,17 +98,18 @@ else:
         '.tlz': ['tar', '--lzma', '-xf'],
         '.tar.xz': ['tar', '-Jf'],
         '.txz': ['tar', '--xJf'],
-        '.7z': ['7zr', 'x']
+        '.7z': ['7zr', 'x'],
+        '.mkv': ['cp', '-r']
     }
     # Test command exists and if not, remove.
     for command in required_cmds:
         if not which(command):
-            for k, v in list(EXTRACT_COMMANDS.items()):
+            for k, v in list(PROCESS_COMMANDS.items()):
                 if command in v[0]:
                     log.warning('%s not found, disabling support for %s' % (command, k))
-                    del EXTRACT_COMMANDS[k]
+                    del PROCESS_COMMANDS[k]
 
-if len(EXTRACT_COMMANDS) == 0:
+if len(PROCESS_COMMANDS) == 0:
     raise Exception('No archive extracting programs found, plugin will be disabled.')
 
 
@@ -115,10 +121,13 @@ class Core(CorePluginBase):
         self.check_thread = None
 
     def enable(self):
-        log.info("ExtractorPlus enabled.")
+        log.debug("ExtractorPlus enabled.")
         self.config = deluge.configmanager.ConfigManager(
             'extractorplus.conf', DEFAULT_PREFS
         )
+        if "append_file_name" not in self.config:
+            self.config["append_file_name"] = False
+            self.config.save()
         if "auto_cleanup" not in self.config:
             self.config["auto_cleanup"] = False
             self.config.save()
@@ -134,13 +143,13 @@ class Core(CorePluginBase):
             )['download_location']
         self.check_thread = RepeatedTimer(30, self.check_cleanup)
         if self.config['auto_cleanup']:
-            log.info("Starting check thread...")
+            log.debug("Starting check thread...")
             self.check_thread.start()
         else:
             try:
                 self.check_thread.stop()
             except Exception as q:
-                log.info("Exception stopping check thread: %s" % q)
+                log.debug("Exception stopping check thread: %s" % q)
         component.get('EventManager').register_event_handler(
             'TorrentFinishedEvent', self._on_torrent_finished
         )
@@ -150,7 +159,7 @@ class Core(CorePluginBase):
             'TorrentFinishedEvent', self._on_torrent_finished
         )
         if self.check_thread is not None:
-            log.info("Stopping check thread.")
+            log.debug("Stopping check thread.")
             try:
                 self.check_thread.stop()
             except Exception as ex:
@@ -172,13 +181,13 @@ class Core(CorePluginBase):
                 file_time = os.path.getmtime(f)
                 file_age = now - file_time
                 if file_age / 3600 >= cleanup_time:
-                    log.info("Auto-deleting %s after %s hour(s)." % (f, cleanup_time))
+                    log.debug("Auto-deleting %s after %s hour(s)." % (f, cleanup_time))
                     os.remove(f)
                     save = True
                 else:
                     new_extracted.append(f)
             else:
-                log.info("File %s no longer exists, removing from tracking." % f)
+                log.debug("File %s no longer exists, removing from tracking." % f)
                 save = True
         if save:
             self.config['extracted'] = new_extracted
@@ -188,21 +197,37 @@ class Core(CorePluginBase):
         """
         This is called when a torrent finishes and checks if any files to extract.
         """
+
+        log.debug("\n\n[EXTRACTORPLUS] !!! -  OnTorrentComplete Started\n\n")
+
+
         tid = component.get('TorrentManager').torrents[torrent_id]
         self.EXTRACT_TOTAL = 0
         t_status = tid.get_status([], False, False, True)
-        do_extract = False
+
+        do_process = False
+
         tid.is_finished = False
         tid.update_state()
+
+        # Fetch our torrent's name
         torrent_name = t_status['name']
-        log.info("Processing completed torrent: %s" % torrent_name)
+        log.debug("[EXTRACTORPLUS] !!! -   New Torrent Added to Extractor Plus: %s" % torrent_name)
+
+
         # Fetch our torrent's label
         labels = self.get_labels(torrent_id)
-        log.debug("Labels collected for %s: %s" % (torrent_name, labels))
+        log.debug("[EXTRACTORPLUS] !!! -   Labels collected for %s: %s" % (torrent_name, labels))
+
+
         # If we've set a label filter, process it
         filters = self.config['label_filter'].replace(" ", "")
         matched_label = None
-        to_extract = []
+
+        # Holds the file objects we will copy and extract
+        to_process = []
+
+
         if filters != "":
             if len(labels) > 0:
                 # Make the label list once, save needless processing.
@@ -210,32 +235,43 @@ class Core(CorePluginBase):
                     label_list = filters.split(",")
                 else:
                     label_list = [filters]
-                log.debug("Filters collected: %s" % label_list)
+                log.debug("[EXTRACTORPLUS] !!! -   Filters collected: %s" % label_list)
 
                 # Make sure there's actually a label
                 for label in labels:
                     if label in label_list:
-                        log.info("Label match (%s), checking %s for archives." % (label, torrent_name))
+                        log.debug("[EXTRACTORPLUS] !!! -   Label match (%s), checking %s for archives." % (label, torrent_name))
                         matched_label = label
-                        do_extract = True
+                        do_process = True
                         break
                     # We don't need to keep checking labels if we've found a match
-                    if do_extract:
+                    if do_process:
                         break
+
+
         # Otherwise, we just extract everything
         else:
-            log.info("No label filters, extracting: %s" % torrent_name)
-            do_extract = True
+            log.debug("[EXTRACTORPLUS] !!! -   No label filters, extracting: %s" % torrent_name)
+            do_process = True
 
-        if do_extract:
+
+        # If we found files to process, process them.
+        if do_process:
+
+            # Load ExtractorPlus Configuration
             extract_in_place = self.config["extract_in_place"]
             extract_selected_folder = self.config["extract_selected_folder"]
             append_label = self.config["append_matched_label"]
+            append_file_name = self.config["append_file_name"]
             extract_torrent_root = self.config["extract_torrent_root"]
             dest = Path(self.config["extract_path"])
 
+
+            # Append label to destination path if we matched a label and user configured appending label
             if extract_selected_folder and append_label and matched_label is not None:
                 dest = dest.joinpath(matched_label)
+
+
             # Override destination if extract_torrent_root is set
             if extract_torrent_root:
                 dest = Path(t_status['download_location']).joinpath(t_status['name'])
@@ -243,41 +279,82 @@ class Core(CorePluginBase):
             files = tid.get_files()
 
             for f in files:
+
+                # Get file path and destination path after 
                 file = f['path']
+                file_dest = dest
+                original_dest = dest
+
                 # Override destination to file path if in_place set
                 f_parent = Path(t_status['download_location']).joinpath(os.path.dirname(f['path']))
                 if extract_in_place and ((not os.path.exists(f_parent)) or os.path.isdir(f_parent)):
-                    dest = f_parent
+                    file_dest = f_parent
+
+                # Get file root and file extension. Also get secondary extension in case it's a .tar file.
                 file_root, file_ext = os.path.splitext(f['path'])
                 file_ext_sec = os.path.splitext(file_root)[1]
+
+                # Get Extra extension if it's a tar file
                 if file_ext_sec == ".tar":
                     file_ext = file_ext_sec + file_ext
                     file_root = os.path.splitext(file_root)[0]
-                    # IF it's not extractable, move on.
-                if file_ext not in EXTRACT_COMMANDS:
+
+                # If the file extension is not found in the PROCESS_COMMANDS array skip.
+                if file_ext not in PROCESS_COMMANDS:
                     continue
 
-                    # Check to prevent double extraction with rar/r00 files
+                # Append the archive name if user setting is found.
+                if append_file_name:
+                    file_dest = Path(file_dest).joinpath(file_root)
+
+                # Check to see if a .rar exists when we run into a .r00 to prevent double extraction.
                 if file_ext == '.r00' and any(x['path'] == file_root + '.rar' for x in files):
-                    log.debug('Skipping file with .r00 extension because a matching .rar file exists: %s' % file)
+                    log.debug('[EXTRACTORPLUS] !!! -   Skipping file with .r00 extension because a matching .rar file exists: %s' % file)
                     continue
 
-                    # Check for RAR archives with PART in the name
+                # Check for RAR archives with PART in the name
                 if file_ext == '.rar' and 'part' in file_root:
                     part_num = file_root.split('part')[1]
                     if part_num.isdigit() and int(part_num) != 1:
-                        log.debug('Skipping remaining multi-part rar files: %s' % file)
+                        log.debug('[EXTRACTORPLUS] !!! -   Skipping remaining multi-part rar files: %s' % file)
                         continue
-                eo = ExtractObject(f['path'], dest)
-                to_extract.append(eo)
 
-        if len(to_extract) > 0:
-            thread = Thread(target=self.process_files, args=(to_extract, t_status, torrent_id, torrent_name))
+                
+                # Log the Details of the configuration and File
+                log.debug("\n\t\n\t")
+                log.debug("[EXTRACTORPLUS] !!! -   [ %s Extension Found ]" % 'Copy' if file_ext in ext_cp else 'Extract')
+                log.debug("[EXTRACTORPLUS] !!! - ----------------------------")
+                log.debug("[EXTRACTORPLUS] !!! -  ")
+                log.debug("[EXTRACTORPLUS] !!! -  ")
+                log.debug("[EXTRACTORPLUS] !!! -   (Extractor Plus Configuration)")
+                log.debug("[EXTRACTORPLUS] !!! -  ")
+                log.debug("\t - Extract In Place: %s" % extract_in_place)
+                log.debug("\t - Extract Selected Folder: %s" % extract_selected_folder)
+                log.debug("\t - Append Label: %s" % append_label)
+                log.debug("\t - Append Archive: %s" % append_file_name)
+                log.debug("\t - Extract Torrent Root: %s" % extract_torrent_root)
+                log.debug("[EXTRACTORPLUS] !!! -  ")
+                log.debug("[EXTRACTORPLUS] !!! -  ")
+                log.debug("[EXTRACTORPLUS] !!! -  (File Configuration)")
+                log.debug("[EXTRACTORPLUS] !!! -  ")
+                log.debug("\t - File Path: %s" % str(file))
+                log.debug("\t - File Extension: %s" % file_ext)
+                log.debug("\t - File Label: %s", matched_label)
+                log.debug("\t - Original Destination: %s" % original_dest)
+                log.debug("\t - Current Destination: %s" % file_dest)
+                log.debug("\n\n")
+
+
+                eo = FileActionObject(f['path'], file_dest, 'copy' if file_ext in ext_cp else 'extract')
+                to_process.append(eo)
+
+        if len(to_process) > 0:
+            thread = Thread(target=self.process_files, args=(to_process, t_status, torrent_id, torrent_name))
             thread.start()
         else:
             tid.is_finished = True
             tid.update_state()
-            log.info("Processing complete for torrent: %s" % torrent_name)
+            log.debug("Processing complete for torrent: %s" % torrent_name)
 
     """
     """
@@ -285,108 +362,286 @@ class Core(CorePluginBase):
     def process_files(self, files: list, t_status: object, torrent_id: str, torrent_name: str) -> object:
         extract_objects = []
         torrent = component.get('TorrentManager').torrents[torrent_id]
-        file: ExtractObject
+        file: FileActionObject
+
+
+        log.debug("\n\n")
+        log.debug("[EXTRACTORPLUS] !!! -   [ Process FILES Thread Started ]")
+        log.debug("[EXTRACTORPLUS] !!! - ----------------------------\n")
         for file in files:
             full_command = None
+
+            # Get file root and file extension. Also attempt to get second extension in case it's a tar file.
             file_root, file_ext = os.path.splitext(file.path)
-            file_ext_sec = os.path.splitext(file_root)[1]
+            file_ext_sec = os.path.splitext(file_root)[1]             
+
+
+            # If It's a tar file append both extensions to file_ext
             if file_ext_sec == ".tar":
                 file_ext = file_ext_sec + file_ext
-            log.info("Extracting %s" % file.path)
+
+            log.debug("\n\t - File Path Before Combining with Download location: %s" % file.path)
+            # Combine the file name and extension with the download location.
+
+            ofpath = file.path
             fpath = os.path.normpath(os.path.join(t_status['download_location'], file.path))
             file.path = fpath
+
+            log.debug("\n\t - File Path Before and After Combining with Download location")
+            log.debug("\t Before: %s" % ofpath)
+            log.debug("\t After: %s" % fpath)
+			
             # Get base commands
-            full_command = EXTRACT_COMMANDS[file_ext].copy()
+            full_command = PROCESS_COMMANDS[file_ext].copy()
             # Append file path
             file.command1 = full_command
             # Check to see if we need two steps for windows/7z
             if file_ext in EXTRA_COMMANDS:
                 file.command2 = EXTRA_COMMANDS[file_ext].copy()
+
+
+
+            log.debug("[EXTRACTORPLUS] !!! -  Modified File For Process\n")
+            log.debug("\t - Original File Path: %s" % ofpath)
+            log.debug("\t - File Path: %s" % file.path)
+            log.debug("\t - File Destination: %s" % file.destination)
+            log.debug("\t - File Action: %s" % file.action)
+            
             extract_objects.append(file)
 
         if len(extract_objects) > 0:
             use_temp = self.config["use_temp_dir"]
-            ex_obj: ExtractObject
+            ex_obj: FileActionObject
             for ex_obj in extract_objects:
-                self.do_extract(ex_obj, torrent_id)
+                self.process_file(ex_obj, torrent_id)
             if use_temp:
                 ex_dir = Path(tempfile.gettempdir()).joinpath(str(torrent_id))
-                os.rmdir(ex_dir)
+                if os.path.exists(ex_dir):
+                    os.rmdir(ex_dir)
+                    log.debug("Removing Directory: %s", ex_dir)
         torrent.is_finished = True
         torrent.update_state()
-        log.info("Processing complete for torrent: %s" % torrent_name)
+        log.debug("Processing complete for torrent: %s" % torrent_name)
 
-    def do_extract(self, to_extract, torrent_id):
+    def process_file(self, to_process, torrent_id):
         """
         :param torrent_id:
-        :type to_extract: ExtractObject
+        :type to_process: FileActionObject
         """
-        destination = to_extract.destination
+        
         use_temp = self.config["use_temp_dir"]
-        ex_dir = to_extract.destination
-        if use_temp:
+        destination = to_process.destination
+        ex_dir = to_process.destination
+        copyFiles = to_process.action == "copy"
+        extractFiles = to_process.action == "extract"
+        processError = False
+
+
+        copy_only = False
+        ps_error = False
+
+
+        log.debug("\n\n")
+        log.debug("[EXTRACTORPLUS] !!! -   [ Process File Job Started ]")
+        log.debug("[EXTRACTORPLUS] !!! - ----------------------------\n")
+
+
+        # If use temporary is selected and we are extracting
+        if use_temp and not(copyFiles):
             ex_dir = Path(tempfile.gettempdir()).joinpath(str(torrent_id))
+            log.debug("!! - Set Process Destination Path to %s" % ex_dir)
         try:
             if not (os.path.exists(ex_dir) and os.path.isdir(ex_dir) and use_temp):
                 os.makedirs(ex_dir)
+                log.debug("!! -  Made Directory ex_dir %s" % ex_dir)
         except Exception as f:
-            log.info("MKEX: %s" % f)
+            log.debug("MKEX: %s" % f)
         try:
-            commands = to_extract.command1
-            commands.append(to_extract.path)
+            commands = to_process.command1
+            commands.append(to_process.path)
+
+
+
+            # Get any existing files in the destination directory
             existing_files = os.listdir(ex_dir)
-            if to_extract.command2 is None:
-                log.info('Extracting with command: "%s" to "%s"' % (" ".join(commands), str(ex_dir.name)))
-                ps = subprocess.Popen(to_extract.command1, cwd=ex_dir, stdout=subprocess.PIPE)
-                ps.wait()
-                log.info("Extraction complete.")
-            else:
-                log.info("Extracting with commands: '%s' and '%s'" % (" ".join(commands), to_extract.command2))
-                ps = subprocess.Popen(to_extract.command1, cwd=ex_dir, stdout=subprocess.PIPE)
-                _ = subprocess.check_output(to_extract.command2, cwd=ex_dir, stdin=ps.stdout)
-                ps.wait()
-            if ps.returncode != 0:
-                log.error(
-                    'Extract failed for %s with code %s' % (ex_dir, ps.returncode)
-                )
-            else:
-                now = datetime.datetime.now().timestamp()
-                if use_temp:
-                    log.debug("Moving files from temp...")
-                    try:
-                        allfiles = os.listdir(ex_dir)
+
+            # Process Extraction Jobs
+            if extractFiles:
+                
+                # Process Extraction job for single commands
+                if to_process.command2 is None:
+                    log.debug("\n[EXTRACTORPLUS] !!! -  Extracting (Command1)")
+                    log.debug("\t - Command1: %s" % to_process.command1)
+                    log.debug("\t - Working Directory: %s" % ex_dir)
+                    ps = subprocess.Popen(to_process.command1, cwd=ex_dir, stdout=subprocess.PIPE)
+                    ps.wait()
+                    log.debug("[EXTRACTORPLUS] !!! -  Extraction complete.\n")
+
+
+                # Process Extraction Job for dual command
+                else:
+                    log.debug("\n[EXTRACTORPLUS] !!! -  Extracting (Command1 & Command2)")
+                    log.debug("\t - Command1: %s" % to_process.command1)
+                    log.debug("\t - Command2: %s" % to_process.command2)
+                    log.debug("\t - Working Directory: %s" % ex_dir)
+                    ps = subprocess.Popen(to_process.command1, cwd=ex_dir, stdout=subprocess.PIPE)
+                    _ = subprocess.check_output(to_process.command2, cwd=ex_dir, stdin=ps.stdout)
+                    ps.wait()
+                
+                # Check for Error during extraction
+                if ps.returncode != 0:
+                    log.error('\n[EXTRACTORPLUS] !!! -  Extract FAILED for \n\t-Path: %s \n\t-Dest:%s\n\t-Return Code: %s' % (to_process.command,ex_dir, ps.returncode))
+                    processError = True
+
+                # If we didn't get an error during extraction process extracted files.
+                if not(processError):
+
+                    # Get current date and time to set modified date on extracted files.
+                    now = datetime.datetime.now().timestamp()
+
+                    # If we use temporary files, move extracted files to destination and log destination file.
+                    if use_temp:    
                         try:
-                            if not (os.path.exists(destination) and os.path.isdir(destination)):
-                                os.makedirs(destination)
-                        except OSError as ex:
-                            if not (ex.errno == errno.EEXIST and os.path.isdir(destination)):
-                                log.error("Error creating destination folder: %s" % ex)
-                        log.debug("Moving files for %s from temp to %s." % (to_extract.path, destination))
+
+                            # Get all files in temporary extraction directory
+                            allfiles = os.listdir(ex_dir)
+                            try:
+                                # Check if destination directory exists and if not create it.
+                                if not (os.path.exists(destination) and os.path.isdir(destination)):
+                                    log.debug("\n[EXTRACTORPLUS] !!! -  Creating Destination Directory: %s" % destination)
+                                    os.makedirs(destination)
+                            except OSError as ex:
+                                if not (ex.errno == errno.EEXIST and os.path.isdir(destination)):
+                                    log.error("\n[EXTRACTORPLUS] !!! -  Error creating destination folder: %s" % ex)
+
+                           # Get extraction history from config file
+                            extracted = self.config['extracted']
+
+                            # Loop over all the files in the temporary directory
+                            for f in allfiles:
+
+                                # Join the temporary directory with the file
+                                src = ex_dir.joinpath(f)
+
+                                # Join the destination directory with the file
+                                dest = Path(destination).joinpath(f)
+
+                                # Create a temporary destination file so we can detect in flight copies.
+                                temp_dest = "%s.extplus" % dest
+
+                                # Move file to temporary file at correct destination
+                                log.debug("\n[EXTRACTORPLUS] !!! -  Moving from Temporary Directory - shutil")
+                                log.debug("\t - Temporary Source File: %s" % src)
+                                log.debug("\t - Temporary Dest File: %s" % temp_dest)
+
+                                shutil.move(src, temp_dest)
+
+                                log.debug("\n[EXTRACTORPLUS] !!! -  Renaming Temporary File - shutil")
+                                log.debug("\t - Temporary File: %s" % temp_dest)
+                                log.debug("\t - Permanent File: %s" %  dest)
+                                shutil.move(temp_dest, dest)
+
+                                # Update access and modified time to curernt time for destination file.
+                                os.utime(dest, (now, now))
+
+                                # Add destination file to extracted log in configuration
+                                extracted.append(str(dest))
+
+                            # Update extracted files array in configuration with new destination file path included.
+                            self.config['extracted'] = extracted
+
+                            # Save updated configuration
+                            self.config.save()
+                        except OSError as e:
+                            log.error("Error: %s : %s" % (ex_dir, e.strerror))
+                    else:
+
+                        # Get extraction history from config file
                         extracted = self.config['extracted']
-                        for f in allfiles:
-                            src = ex_dir.joinpath(f)
-                            dest = Path(destination).joinpath(f)
-                            temp_dest = "%s.extplus" % dest
-                            log.info("Moving %s to %s" % (src, temp_dest))
-                            shutil.move(src, temp_dest)
-                            log.info("Renaming %s to %s" % (temp_dest, dest))
-                            shutil.move(temp_dest, dest)
-                            os.utime(dest, (now, now))
-                            extracted.append(str(dest))
+
+                        # Get files in extraction directory
+                        new_files = os.listdir(ex_dir)
+
+                        # Loop over files and compare them with the files that existed before extraction.
+                        for new_file in new_files:
+                            if new_file not in existing_files:
+
+                                # Get Destination filepath from extraction directory and file.
+                                dest = Path(ex_dir).joinpath(new_file)
+
+                                # Update access and modified time to current time for destination file.
+                                os.utime(dest, (now, now))
+
+                                # Add destination file to extracted log in configuration
+                                extracted.append(str(dest))
+
+                        # Update extracted files array in configuration with new destination file path included.
                         self.config['extracted'] = extracted
                         self.config.save()
-                    except OSError as e:
-                        log.error("Error: %s : %s" % (ex_dir, e.strerror))
-                else:
-                    extracted = self.config['extracted']
-                    new_files = os.listdir(ex_dir)
-                    for new_file in new_files:
-                        if new_file not in existing_files:
-                            dest = Path(ex_dir).joinpath(new_file)
-                            os.utime(dest, (now, now))
-                            extracted.append(str(dest))
-                    self.config['extracted'] = extracted
-                    self.config.save()
+
+
+            # Process Copy Jobs
+            if copyFiles:
+
+
+                # Get current date and time to set modified date on copied files.
+                now = datetime.datetime.now().timestamp()
+
+
+                # Combine destination path with filename
+                finalDestination = Path(ex_dir).joinpath(os.path.basename(to_process.path))
+                tempDestination = "%s.extplus" % dest
+
+
+                log.debug("\n[EXTRACTORPLUS] !!! -  Copying File")
+                log.debug("\n[EXTRACTORPLUS] !!! - --------------")
+                log.debug("\t - Source: %s" % to_process.path)
+                log.debug("\t - Destination: %s" % finalDestination)
+                log.debug("\t - Temp Destination: %s" % tempDestination)
+                log.debug("\n")
+
+
+                # Move file to destination directory with temporary name.
+                log.debug("[EXTRACTORPLUS] !!! -  Copy From: %s  ->  %s" % (to_process.path, tempDestination))
+                shutil.move(to_process.path, tempDestination)
+
+                # Rename temporary file to final name.
+                log.debug("[EXTRACTORPLUS] !!! -  Rename From: %s  ->  %s" % (tempDestination, finalDestination))
+                shutil.move(tempDestination, finalDestination)
+
+
+                # Get the extracted file log from configuration
+                extracted = self.config['extracted']
+
+                # Get all files in extraction directory
+                new_files = os.listdir(ex_dir)
+
+                # Loop over all the files in the extraction directory
+                for new_file in new_files:
+
+                    # If new file does not exist in the copy file log add an entry.
+                    if new_file not in existing_files:
+
+                        # Create new file path for logging.
+                        dest = Path(ex_dir).joinpath(new_file)
+
+                        
+                        log.debug("\n[EXTRACTORPLUS] !!! -  New File Added to Copy Log")
+                        log.debug("\t - %s", dest)
+
+                        # Update the new file modified time.
+                        os.utime(dest, (now, now))
+
+                        # Append the log record to our in memory array of logs.
+                        extracted.append(str(dest))
+
+                # Write out the new logging array to configuration.
+                self.config['extracted'] = extracted
+
+                # Save the configuration
+                self.config.save()
+
+                
         except Exception as e:
             log.error("Extract Exception: %s" % e)
 
@@ -431,9 +686,18 @@ class Core(CorePluginBase):
         return self.config.config
 
 
-class ExtractObject:
-    def __init__(self, path, destination):
+class FileActionObject:
+    def __init__(self, path, destination, action):
         self.path = path
         self.destination = destination
+        self.action = action
         self.command1 = None
         self.command2 = None
+
+        log.debug("\n\n")
+        log.debug("[EXTRACTORPLUS] !!! -  Creating FileActionObject")
+        log.debug("\t- Path: %s" % path)
+        log.debug("\t- Destination: %s" % destination)
+        log.debug("\t- Action: %s" % action)
+        log.debug("\n")
+        

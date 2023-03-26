@@ -1,10 +1,10 @@
 ﻿$ver = "39"
-$eggver = "3.9"
+$eggver = "3.10"
 if ($args) {
     $ver = $args[0]
 }
 
-$python_paths = "$env:LOCALAPPDATA\Programs\Python\", "$Env:Programfiles\"
+$python_paths = "$env:LOCALAPPDATA\Programs\Python\"
 $deluge_path = "$env:APPDATA\deluge\plugins\"
 $built = $false
 for ($j = 0; $j -lt $python_paths.count; $j++) {
@@ -24,6 +24,7 @@ for ($j = 0; $j -lt $python_paths.count; $j++) {
 }
 
 if (Test-Path -Path ".\dist\ExtractorPlus-1.6.1-py$eggver.egg") {
+    Write-Host "Found egg $eggver"
     Write-Host "Copying egg to $deluge_path"
     Copy-Item ".\dist\ExtractorPlus-1.6.1-py$eggver.egg" -Destination $deluge_path -Force
 } else {
@@ -57,4 +58,4 @@ if ($deluged) {
     Write-Host "Restarting deluge-debug"    
 }
 
-Start-Process -FilePath 'C:\Program Files\Deluge\deluge-debug.exe' -ArgumentList "-l C:\b\deluge.log -L debug" -NoNewWindow
+Start-Process -FilePath 'C:\Program Files\Deluge\deluge-debug.exe' -ArgumentList "-L debug -l C:\b\deluge.log" -NoNewWindow
